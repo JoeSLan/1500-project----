@@ -17,9 +17,25 @@ from auditor.extractor import ExtractionResult, extract_pdf
 from auditor.report import property_rows, to_docx, to_json, to_markdown, zoning_rows
 from auditor.schemas import CATEGORY_LABELS, RISK_LABELS, SEVERITY_LABELS, SEVERITY_ORDER
 
+# 1. IMPORTANTE: Importamos el sistema de autenticación SaaS
+from auditor.auth_ui import render_login_screen, render_user_sidebar
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 st.set_page_config(page_title="LegalSite Auditor", page_icon="⚖️", layout="wide")
+
+# ------------------------------------------------------------------
+# PROTECCIÓN SAAS: VALIDAR LOGIN Y MEMBRESÍA ANTES DE MOSTRAR NADA
+# ------------------------------------------------------------------
+user = render_login_screen()
+
+if not user:
+    # Si el usuario no ha iniciado sesión, se detiene la ejecución aquí
+    st.stop()
+
+# Si ya inició sesión, mostramos sus datos de membresía en la barra lateral
+render_user_sidebar(user)
+# ------------------------------------------------------------------
 
 SEVERITY_ICONS = {"CRITICA": "🔴", "ALTA": "🟠", "MEDIA": "🟡", "BAJA": "🔵"}
 RISK_ICONS = {"CRITICO": "🔴", "ALTO": "🟠", "MEDIO": "🟡", "BAJO": "🟢"}
