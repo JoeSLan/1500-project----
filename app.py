@@ -1,5 +1,7 @@
 """LegalSite Auditor — Streamlit UI.
 
+Access is gated by login + membership + single active session (see auditor/auth_ui.py).
+
 Run with:  streamlit run app.py
 """
 
@@ -11,31 +13,16 @@ from pathlib import Path
 import streamlit as st
 
 from auditor.analyzer import AnalysisOutcome, LegalAnalyzer
+from auditor.auth_ui import render_account_panel, require_auth
 from auditor.config import SAMPLES_DIR, Settings, load_settings
 from auditor.exceptions import AuditorError
 from auditor.extractor import ExtractionResult, extract_pdf
 from auditor.report import property_rows, to_docx, to_json, to_markdown, zoning_rows
 from auditor.schemas import CATEGORY_LABELS, RISK_LABELS, SEVERITY_LABELS, SEVERITY_ORDER
 
-# 1. IMPORTANTE: Importamos el sistema de autenticación SaaS
-from auth_ui import render_login_screen, render_user_sidebar
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 st.set_page_config(page_title="LegalSite Auditor", page_icon="⚖️", layout="wide")
-
-# ------------------------------------------------------------------
-# PROTECCIÓN SAAS: VALIDAR LOGIN Y MEMBRESÍA ANTES DE MOSTRAR NADA
-# ------------------------------------------------------------------
-user = render_login_screen()
-
-if not user:
-    # Si el usuario no ha iniciado sesión, se detiene la ejecución aquí
-    st.stop()
-
-# Si ya inició sesión, mostramos sus datos de membresía en la barra lateral
-render_user_sidebar(user)
-# ------------------------------------------------------------------
 
 SEVERITY_ICONS = {"CRITICA": "🔴", "ALTA": "🟠", "MEDIA": "🟡", "BAJA": "🔵"}
 RISK_ICONS = {"CRITICO": "🔴", "ALTO": "🟠", "MEDIO": "🟡", "BAJO": "🟢"}
@@ -198,12 +185,16 @@ def render_results(outcome: AnalysisOutcome, file_name: str) -> None:
 
 # --------------------------------------------------------------------- main
 def main() -> None:
+    # Access control: login form / paywall render here and stop the script until access is valid.
+    account = require_auth()
+
     try:
         settings = get_settings()
     except AuditorError as exc:
         st.error(str(exc))
         st.stop()
 
+    render_account_panel(account)
     render_sidebar(settings)
     st.title("⚖️ LegalSite Auditor")
     st.caption("Due diligence legal-urbana asistida por IA para inmuebles en el Estado de México y CDMX.")

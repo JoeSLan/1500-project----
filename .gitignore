@@ -9,3 +9,8 @@ reports/*
 samples/*.pdf
 !samples/expediente_prueba.pdf
 .DS_Store
+
+# SaaS accounts and secrets (never commit)
+users.json
+.streamlit/secrets.toml
+*.tmp
