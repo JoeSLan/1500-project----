@@ -1,0 +1,9 @@
+[project]
+name = "legalsite-auditor"
+version = "0.1.0"
+description = "Due diligence legal-urbana asistida por IA (Edomex / CDMX)"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
