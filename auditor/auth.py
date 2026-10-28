@@ -7,10 +7,12 @@ admin CLI. The Streamlit layer lives in ``auditor/auth_ui.py``.
 from __future__ import annotations
 
 import base64
+import calendar
 import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 import threading
 import time
@@ -26,6 +28,10 @@ TIMEZONE = ZoneInfo("America/Mexico_City")
 PlanType = Literal["mensual", "anual", "vitalicio"]
 PLAN_TYPES: tuple[str, ...] = ("mensual", "anual", "vitalicio")
 PLAN_LABELS: dict[str, str] = {"mensual": "Mensual", "anual": "Anual", "vitalicio": "Vitalicio"}
+
+MIN_PASSWORD_LENGTH = 8
+MAX_PASSWORD_LENGTH = 128
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[a-z]{2,}$", re.IGNORECASE)
 
 HASH_ALGORITHM = "pbkdf2_sha256"
 HASH_ITERATIONS = 600_000
@@ -189,13 +195,33 @@ def read_users_json(path: Path) -> list[dict[str, Any]]:
     return data
 
 
-def authenticate(directory: UserDirectory, email: str, password: str) -> User | None:
-    """Return the user if the password matches. Runs a hash even for unknown emails (timing-safe)."""
-    user = directory.get(email)
+def check_credentials(user: User | None, password: str) -> User | None:
+    """Return the user if the password matches. Runs a hash even for unknown users (timing-safe)."""
     if user is None:
         verify_password(password, _dummy_hash())
         return None
     return user if user.check_password(password) else None
+
+
+def authenticate(directory: UserDirectory, email: str, password: str) -> User | None:
+    return check_credentials(directory.get(email), password)
+
+
+def is_valid_email(email: str) -> bool:
+    return bool(_EMAIL_RE.match(normalize_email(email))) and len(email) <= 254
+
+
+def validate_registration(email: str, password: str, confirm: str) -> str | None:
+    """Return a user-facing error message, or None if the sign-up data is acceptable."""
+    if not is_valid_email(email):
+        return "Escribe un correo electrónico válido."
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return f"La contraseña debe tener al menos {MIN_PASSWORD_LENGTH} caracteres."
+    if len(password) > MAX_PASSWORD_LENGTH:
+        return f"La contraseña no puede tener más de {MAX_PASSWORD_LENGTH} caracteres."
+    if password != confirm:
+        return "Las contraseñas no coinciden."
+    return None
 
 
 # --------------------------------------------------------------- membership
@@ -228,6 +254,33 @@ def evaluate_membership(user: User, today: date | None = None) -> MembershipStat
             False, "VENCIDA", days, f"Tu plan {PLAN_LABELS[user.plan_type]} venció el {user.exp_date:%d/%m/%Y}."
         )
     return MembershipStatus(True, "ACTIVA", days, f"Vence el {user.exp_date:%d/%m/%Y}")
+
+
+def add_months(start: date, months: int) -> date:
+    """Same day N months later, clamped to the month's last day (31 ene + 1 mes = 28/29 feb)."""
+    month_index = start.month - 1 + months
+    year, month = start.year + month_index // 12, month_index % 12 + 1
+    return date(year, month, min(start.day, calendar.monthrange(year, month)[1]))
+
+
+def next_expiration(plan: str, current: date | None, today: date) -> date | None:
+    """Extend from the later of today or the current expiration, so early renewals don't lose days."""
+    if plan == "vitalicio":
+        return None
+    base = max(today, current) if current else today
+    return add_months(base, 1 if plan == "mensual" else 12)
+
+
+def signup_expiration(today: date, signup_days: int | None) -> date:
+    """Expiration for a new self-registered account (default plan 'mensual').
+
+    signup_days=None -> one calendar month (the monthly plan period).
+    signup_days=0    -> expires today at midnight, i.e. the user must pay to keep using it tomorrow;
+    use a negative value to require payment before any access.
+    """
+    if signup_days is None:
+        return add_months(today, 1)
+    return date.fromordinal(today.toordinal() + signup_days)
 
 
 # ------------------------------------------------------------ session control
@@ -318,3 +371,23 @@ class SessionRegistry:
     def clear_failures(self, email: str) -> None:
         with self._lock:
             self._failures.pop(normalize_email(email), None)
+
+
+class RateLimiter:
+    """Sliding-window limiter (in-process). Used to throttle self-registrations."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._hits: dict[str, list[float]] = {}
+
+    def allow(self, key: str, limit: int, window_s: int, now: float | None = None) -> bool:
+        """Record a hit for `key` and return True if it is within `limit` per `window_s`."""
+        now = time.time() if now is None else now
+        with self._lock:
+            recent = [t for t in self._hits.get(key, []) if now - t < window_s]
+            if len(recent) >= limit:
+                self._hits[key] = recent
+                return False
+            recent.append(now)
+            self._hits[key] = recent
+            return True

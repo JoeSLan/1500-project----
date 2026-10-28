@@ -17,7 +17,6 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import calendar
 import getpass
 import json
 import sys
@@ -30,8 +29,10 @@ from auditor.auth import (
     PLAN_TYPES,
     User,
     UserConfigError,
+    add_months,  # noqa: F401  (re-exported for backwards compatibility)
     evaluate_membership,
     hash_password,
+    next_expiration,
     normalize_email,
     read_users_json,
     today_mx,
@@ -41,21 +42,6 @@ USERS_FILE = Path(__file__).resolve().parent / "users.json"
 
 
 # ------------------------------------------------------------------ helpers
-def add_months(start: date, months: int) -> date:
-    """Same day N months later, clamped to the month's last day (31 ene + 1 mes = 28/29 feb)."""
-    month_index = start.month - 1 + months
-    year, month = start.year + month_index // 12, month_index % 12 + 1
-    return date(year, month, min(start.day, calendar.monthrange(year, month)[1]))
-
-
-def next_expiration(plan: str, current: date | None, today: date) -> date | None:
-    """Extend from the later of today or the current expiration, so early renewals don't lose days."""
-    if plan == "vitalicio":
-        return None
-    base = max(today, current) if current else today
-    return add_months(base, 1 if plan == "mensual" else 12)
-
-
 def load(path: Path) -> list[dict[str, Any]]:
     return read_users_json(path)
 
