@@ -51,14 +51,31 @@ class _Query:
         raise AssertionError(f"operación no soportada: {self.op}")
 
 
+class _Rpc:
+    def __init__(self, db: "FakeSupabase", name: str, params: dict[str, Any]) -> None:
+        self.db, self.name, self.params = db, name, params
+
+    def execute(self) -> SimpleNamespace:
+        self.db.calls.append(("rpc", self.name, self.params))
+        if self.db.fail_with is not None:
+            raise self.db.fail_with
+        if self.db.rpc_handler is None:
+            raise AssertionError(f"rpc {self.name} sin handler")
+        return SimpleNamespace(data=self.db.rpc_handler(self.name, self.params))
+
+
 class FakeSupabase:
     def __init__(self) -> None:
         self.tables: dict[str, list[dict[str, Any]]] = {}
         self.calls: list[tuple] = []
         self.fail_with: Exception | None = None
+        self.rpc_handler: Any = None
 
     def table(self, name: str) -> _Query:
         return _Query(self, name)
+
+    def rpc(self, name: str, params: dict[str, Any]) -> _Rpc:
+        return _Rpc(self, name, params)
 
     def rows(self, table: str = "users") -> list[dict[str, Any]]:
         return self.tables.get(table, [])

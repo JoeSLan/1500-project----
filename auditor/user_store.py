@@ -21,7 +21,7 @@ REQUEST_TIMEOUT_S = 10
 # PostgreSQL / PostgREST error codes we translate into clear messages.
 _UNIQUE_VIOLATION = "23505"
 _RLS_VIOLATION = "42501"
-_SCHEMA_ERRORS = {"42P01", "42703", "PGRST204", "PGRST205"}  # missing table / column
+_SCHEMA_ERRORS = {"42P01", "42703", "42883", "PGRST202", "PGRST204", "PGRST205"}  # missing table/column/function
 
 
 def is_public_key(key: str) -> bool:
@@ -140,6 +140,41 @@ class SupabaseUserStore:
         rows = getattr(response, "data", None) or []
         return User.from_record(rows[0] if rows else record)
 
+    # ---------------------------------------------------------- payments
+    def apply_payment(
+        self,
+        *,
+        ref: str,
+        email: str,
+        plan: str,
+        subscription_id: str | None = None,
+        customer_id: str | None = None,
+        amount: int | None = None,
+        currency: str | None = None,
+        source: str = "app",
+    ) -> dict[str, Any]:
+        """Call public.apply_stripe_payment (sql/stripe_payments.sql). Idempotent per Stripe reference."""
+        params = {
+            "p_ref": ref,
+            "p_email": normalize_email(email),
+            "p_plan": plan,
+            "p_subscription_id": subscription_id,
+            "p_customer_id": customer_id,
+            "p_amount": amount,
+            "p_currency": currency,
+            "p_source": source,
+        }
+        try:
+            response = self._client.rpc("apply_stripe_payment", params).execute()
+        except Exception as exc:
+            raise self._translate(exc, "aplicar el pago de") from exc
+        data = getattr(response, "data", None)
+        if isinstance(data, list):  # some client versions wrap scalar results
+            data = data[0] if data else None
+        if not isinstance(data, dict):
+            raise UserStoreError("Respuesta inesperada al registrar el pago.")
+        return data
+
     # ----------------------------------------------------------- helpers
     def _translate(self, exc: Exception, action: str) -> UserStoreError:
         code = str(getattr(exc, "code", "") or "")
@@ -152,7 +187,11 @@ class SupabaseUserStore:
                 detail,
             )
         elif code in _SCHEMA_ERRORS:
-            logger.error("Supabase: falta la tabla o una columna (%s). Ejecuta sql/supabase_schema.sql.", detail)
+            logger.error(
+                "Supabase: falta una tabla, columna o función (%s). Ejecuta sql/supabase_schema.sql y "
+                "sql/stripe_payments.sql.",
+                detail,
+            )
         else:
             logger.error("Supabase: error al %s usuario (%s): %s", action, code or type(exc).__name__, detail)
         return UserStoreError("No pudimos conectar con el servicio de cuentas. Intenta de nuevo en unos minutos.")

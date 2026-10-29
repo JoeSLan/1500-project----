@@ -4,13 +4,16 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
-from auditor import user_store
+from auditor import auth_ui, user_store
 from auditor.auth import hash_password, today_mx
+from auditor.payments import DEFAULT_PLAN_LINKS, client_reference_for, email_from_reference
 from tests.fake_supabase import FakeSupabase
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
@@ -227,3 +230,108 @@ def test_brute_force_lockout(db):
         at = _login(at, "cliente@x.com", "mala")
     at = _login(at, "cliente@x.com")
     assert "Demasiados intentos" in _text(at) and not _has_tool(at)
+
+
+# ---------------------------------------------------------------- Stripe
+SESSION_ID = "cs_test_a1B2c3D4e5F6g7H8i9J0"
+
+
+class _FakeStripe:
+    def __init__(self, session):
+        self.session = session
+        self.calls = []
+        retrieve = lambda sid, params=None: (self.calls.append(sid), SimpleNamespace(to_dict=lambda: self.session))[1]  # noqa: E731
+        self.v1 = SimpleNamespace(checkout=SimpleNamespace(sessions=SimpleNamespace(retrieve=retrieve)))
+
+
+def _paid_session(email="vencido@x.com", plan_url=DEFAULT_PLAN_LINKS["anual"], payment_status="paid"):
+    return {
+        "id": SESSION_ID, "status": "complete", "payment_status": payment_status,
+        "client_reference_id": client_reference_for(email), "customer_details": {"email": email},
+        "payment_link": {"id": "plink_1", "url": plan_url, "metadata": {}}, "line_items": {"data": []},
+        "metadata": {}, "subscription": None, "customer": "cus_1", "amount_total": 499000, "currency": "mxn",
+    }
+
+
+def _apply_like_sql(db):
+    """Minimal stand-in for public.apply_stripe_payment: extends the user one year (anual)."""
+    applied: set[str] = set()
+
+    def handler(name, params):
+        assert name == "apply_stripe_payment"
+        row = next((r for r in db.rows() if r["email"] == params["p_email"]), None)
+        if row is None:
+            return {"status": "pending", "email": params["p_email"], "plan": params["p_plan"]}
+        if params["p_ref"] in applied:
+            return {"status": "duplicate", "email": row["email"], "plan": row["plan_type"], "exp_date": row["exp_date"]}
+        applied.add(params["p_ref"])
+        row["plan_type"], row["exp_date"] = params["p_plan"], (today_mx() + timedelta(days=365)).isoformat()
+        return {"status": "applied", "email": row["email"], "plan": row["plan_type"], "exp_date": row["exp_date"]}
+
+    return handler
+
+
+def _app_with_stripe(db, monkeypatch, session, query=SESSION_ID, saas=None):
+    fake_stripe = _FakeStripe(session)
+    monkeypatch.setattr(auth_ui, "get_stripe_client", lambda: fake_stripe)
+    db.rpc_handler = _apply_like_sql(db)
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.secrets["supabase"] = {"url": "https://demo.supabase.co", "key": "sb_secret_test"}
+    at.secrets["stripe"] = {"secret_key": "sk_test_51ABCdefGHIjklMNO"}
+    at.secrets["saas"] = saas or {}
+    if query:
+        at.query_params["session_id"] = query
+    return at.run(), fake_stripe
+
+
+def test_default_plan_buttons_use_stripe_test_links_with_reference(db):
+    at = _login(_app(saas={}), "vencido@x.com")
+    links = _plan_links(at)
+    assert [u.split("?")[0] for u in links] == list(DEFAULT_PLAN_LINKS.values())
+    query = dict(p.split("=", 1) for p in links[1].split("?", 1)[1].split("&"))
+    assert query["prefilled_email"] == "vencido%40x.com"
+    assert email_from_reference(query["client_reference_id"]) == "vencido@x.com"
+    assert "modo de prueba" in _text(at)
+
+
+def test_return_from_stripe_activates_plan(db, monkeypatch):
+    at, fake_stripe = _app_with_stripe(db, monkeypatch, _paid_session())
+    assert not at.exception
+    assert fake_stripe.calls == [SESSION_ID]
+    assert "Pago confirmado. Plan Anual activo hasta el" in _text(at)
+    assert "session_id" not in at.query_params
+    row = next(r for r in db.rows() if r["email"] == "vencido@x.com")
+    assert row["plan_type"] == "anual" and row["exp_date"] > today_mx().isoformat()
+    at = _login(at, "vencido@x.com")  # the expired account now has access
+    assert _has_tool(at) and "Plan **Anual**" in _text(at)
+
+
+def test_return_is_idempotent_on_rerun(db, monkeypatch):
+    at, fake_stripe = _app_with_stripe(db, monkeypatch, _paid_session())
+    at.run()
+    assert fake_stripe.calls == [SESSION_ID]  # query param removed: not processed twice
+
+
+def test_return_before_registering_is_pending(db, monkeypatch):
+    at, _ = _app_with_stripe(db, monkeypatch, _paid_session(email="nuevo@x.com"))
+    assert "Pago recibido para n****@x.com" in _text(at) and "Registrarse" in _text(at)
+
+
+def test_return_with_oxxo_pending(db, monkeypatch):
+    at, _ = _app_with_stripe(db, monkeypatch, _paid_session(payment_status="unpaid"))
+    assert "OXXO" in _text(at)
+    assert next(r for r in db.rows() if r["email"] == "vencido@x.com")["exp_date"] < today_mx().isoformat()
+
+
+@pytest.mark.parametrize("query", ["cs_test_<script>alert(1)</script>", "pi_123"])
+def test_return_ignores_invalid_session_ids(db, monkeypatch, query):
+    at, fake_stripe = _app_with_stripe(db, monkeypatch, _paid_session(), query=query)
+    assert fake_stripe.calls == [] and not at.exception
+
+
+def test_return_without_stripe_configured(db):
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.secrets["supabase"] = {"url": "https://demo.supabase.co", "key": "sb_secret_test"}
+    at.query_params["session_id"] = SESSION_ID
+    at.run()
+    assert "se activará automáticamente en unos minutos" in _text(at)

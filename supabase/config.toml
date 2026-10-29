@@ -1,0 +1,4 @@
+# Configuración para la CLI de Supabase (supabase functions deploy stripe-webhook).
+# Stripe no envía un JWT de Supabase: la autenticación es la firma Stripe-Signature.
+[functions.stripe-webhook]
+verify_jwt = false

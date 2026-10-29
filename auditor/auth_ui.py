@@ -16,7 +16,6 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import streamlit as st
 
@@ -39,6 +38,17 @@ from auditor.auth import (
     validate_registration,
 )
 from auditor.config import PROJECT_ROOT
+from auditor.payments import (
+    PaymentConfigError,
+    StripeConfig,
+    checkout_url,
+    fulfill_checkout_session,
+    is_session_id,
+    links_mode,
+    mask_email,
+    merge_plan_links,
+    validate_secret_key,
+)
 from auditor.user_store import (
     DEFAULT_TABLE,
     EmailAlreadyRegistered,
@@ -64,6 +74,7 @@ _TOKEN = "auth_token"
 _SOURCE = "auth_source"
 _NOTICE = "auth_notice"
 _BROWSER_ID = "auth_browser_id"
+_HANDLED_SESSIONS = "payments_handled_sessions"
 
 PLAN_CATALOG: dict[str, dict[str, Any]] = {
     "mensual": {
@@ -172,6 +183,53 @@ def get_supabase_store() -> SupabaseUserStore | None:
     return _build_supabase_store(url, key, str(config.get("table") or DEFAULT_TABLE))
 
 
+def plan_links() -> dict[str, str]:
+    """Payment Link per plan: [saas.plans.<plan>].url overrides the built-in Stripe links."""
+    return merge_plan_links(_saas_config().get("plans"))
+
+
+def price_plans() -> dict[str, str]:
+    """Optional [stripe.price_plans] {"price_...": "mensual"} mapping (alternative to link matching)."""
+    section = _secrets_section("stripe")
+    mapping = (_to_plain(section) or {}).get("price_plans") if section else None
+    return {str(k): str(v) for k, v in (mapping or {}).items()}
+
+
+def get_stripe_config() -> StripeConfig | None:
+    """Validated st.secrets["stripe"]["secret_key"], or None (logged) when missing/invalid."""
+    section = _secrets_section("stripe")
+    if not section:
+        return None
+    try:
+        config = validate_secret_key(_to_plain(section).get("secret_key"))
+    except PaymentConfigError as exc:
+        logger.error("Stripe: %s", exc)
+        return None
+    mode = links_mode(plan_links())
+    if mode and mode != config.mode:
+        logger.error(
+            "Stripe: la secret_key es de modo %s pero los Payment Links son de modo %s; los pagos no se "
+            "podrán verificar desde la app.", config.mode, mode,
+        )
+    return config
+
+
+@st.cache_resource(show_spinner=False)
+def _build_stripe_client(secret_key: str) -> Any:
+    import stripe  # lazy: only needed when Stripe is configured
+
+    options: dict[str, Any] = {"max_network_retries": 2}
+    api_base = os.getenv("STRIPE_API_BASE")  # only for local tests
+    if api_base:
+        options["base_addresses"] = {"api": api_base}
+    return stripe.StripeClient(secret_key, **options)
+
+
+def get_stripe_client() -> Any | None:
+    config = get_stripe_config()
+    return _build_stripe_client(config.secret_key) if config else None
+
+
 @st.cache_resource
 def get_session_registry() -> SessionRegistry:
     """One registry per server process, shared by every browser session."""
@@ -231,15 +289,10 @@ def logout() -> None:
 
 # --------------------------------------------------------------------- plans
 def _plan_url(plan: str, email: str | None) -> str | None:
-    """Payment link for a plan: [saas.plans.<plan>] url, falling back to [saas] renewal_url.
-
-    A literal "{email}" in the URL is replaced with the user's email (e.g. Stripe ?prefilled_email={email}).
-    """
-    plans = _saas_config().get("plans") or {}
-    url = (plans.get(plan) or {}).get("url") or _saas_setting("renewal_url", "LEGALSITE_RENEWAL_URL")
-    if not url:
-        return None
-    return str(url).replace("{email}", quote(email or "", safe=""))
+    """Payment link for a plan, personalized with the account email (prefilled_email +
+    client_reference_id) so the webhook can credit the right account."""
+    url = plan_links().get(plan)
+    return checkout_url(url, email) if url else None
 
 
 def _plan_price(plan: str) -> str | None:
@@ -278,11 +331,16 @@ def render_plans(user: User | None = None, heading: str = "Planes de suscripció
                 st.button(f"💳 {label}", key=f"plan_{plan}", disabled=True, width="stretch")
                 st.caption("Pago en línea próximamente.")
     if user is None:
-        st.caption("Crea tu cuenta en la pestaña **Registrarse** y después elige tu plan.")
+        st.caption(
+            "Crea tu cuenta en **Registrarse** y elige tu plan desde ahí. Si pagas antes, regístrate con el "
+            "mismo correo que usaste al pagar y tu plan se activará solo."
+        )
     st.caption(
-        "Tras confirmar tu pago activamos o extendemos tu acceso."
+        "Tu acceso se activa o extiende automáticamente al confirmarse el pago."
         + (f" Dudas: {support_email}" if support_email else "")
     )
+    if links_mode(plan_links()) == "test":
+        st.caption("🧪 Pagos en modo de prueba: usa la tarjeta 4242 4242 4242 4242, cualquier fecha futura y CVC.")
 
 
 def render_paywall(user: User, status: MembershipStatus) -> None:
@@ -447,10 +505,61 @@ def _render_retry(message: str) -> None:
         st.rerun()
 
 
+# ------------------------------------------------------- return from Stripe
+def _plan_title(plan: str | None) -> str:
+    return PLAN_CATALOG.get(plan or "", {}).get("title", "tu plan")
+
+
+def handle_payment_return(supabase: SupabaseUserStore | None) -> None:
+    """Fulfill ?session_id=cs_... when the buyer is redirected back from a Stripe Payment Link.
+
+    The webhook does the same; Supabase applies each payment once, whichever arrives first.
+    """
+    session_id = st.query_params.get("session_id")
+    if not session_id:
+        return
+    del st.query_params["session_id"]  # don't re-process on refresh or share it in the URL
+    handled: set[str] = st.session_state.setdefault(_HANDLED_SESSIONS, set())
+    if not is_session_id(session_id) or session_id in handled:
+        return
+    handled.add(session_id)
+
+    stripe_client = get_stripe_client()
+    if stripe_client is None or supabase is None:
+        _set_notice("info", "Recibimos tu regreso del pago. Tu plan se activará automáticamente en unos minutos.")
+        return
+
+    with st.spinner("Confirmando tu pago…"):
+        result = fulfill_checkout_session(stripe_client, supabase, session_id, plan_links(), price_plans())
+    plan = _plan_title(result.plan)
+    if result.status in ("applied", "duplicate"):
+        until = "sin vencimiento" if result.exp_date is None else f"hasta el {result.exp_date:%d/%m/%Y}"
+        _set_notice("success", f"✅ Pago confirmado. Plan {plan} activo {until}.")
+    elif result.status == "pending":
+        _set_notice(
+            "info",
+            f"✅ Pago recibido para {mask_email(result.email)}. Crea tu cuenta con ese mismo correo en "
+            f"**Registrarse** y tu plan {plan} se activará automáticamente.",
+        )
+    elif result.status == "awaiting_payment":
+        _set_notice(
+            "info",
+            "⏳ Tu pago está en proceso (los pagos en OXXO pueden tardar hasta 3 días hábiles). "
+            "Tu plan se activará automáticamente al confirmarse.",
+        )
+    else:
+        _set_notice(
+            "warning",
+            "No pudimos confirmar tu pago en este momento. Si ya pagaste, tu plan se activará "
+            "automáticamente en unos minutos; si no, contáctanos.",
+        )
+
+
 # --------------------------------------------------------------------- gate
 def require_auth() -> Account:
     """Return the authenticated account, or render the access screen / paywall and stop the script."""
     supabase = get_supabase_store()
+    handle_payment_return(supabase)
     static = StaticUserStore(load_user_directory())
     email, token = st.session_state.get(_EMAIL), st.session_state.get(_TOKEN)
     source = st.session_state.get(_SOURCE, static.name)
@@ -487,6 +596,7 @@ def require_auth() -> Account:
     status = evaluate_membership(user)
     if not status.allowed:
         _render_header()
+        _show_notice()
         render_paywall(user, status)
         st.divider()
         if st.button("Cerrar sesión"):

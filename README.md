@@ -16,11 +16,14 @@ legalsite-auditor/
 ├── .env.example               # Plantilla de variables (copiar a .env)
 ├── .streamlit/config.toml     # Tema y límite de carga
 ├── sql/supabase_schema.sql   # Tabla users de Supabase (ejecutar una vez)
+├── sql/stripe_payments.sql   # Tabla payments + activación automática de pagos
+├── supabase/functions/stripe-webhook/index.ts  # Webhook de Stripe (Edge Function)
 ├── .streamlit/secrets.example.toml  # Plantilla de Secrets (Supabase, planes)
 ├── auditor/
 │   ├── auth.py                # Contraseñas, membresías, sesión única
 │   ├── auth_ui.py             # Login, registro, planes y panel "Mi cuenta"
 │   ├── user_store.py          # Lectura/alta de cuentas en Supabase
+│   ├── payments.py            # Links de pago, validación de Stripe y confirmación al regresar
 │   ├── config.py              # Settings desde .env
 │   ├── exceptions.py          # Errores con mensajes para el usuario
 │   ├── extractor.py           # PyMuPDF: texto por página + detección de escaneados
@@ -93,12 +96,6 @@ tabla `users` de Supabase con plan **Mensual**; quien no tiene cuenta o tiene el
 > así nadie puede leer los `password_hash` con la clave pública. La service_role key solo vive en
 > los Secrets del servidor y nunca llega al navegador.
 
-### Activar un pago
-
-Los links de pago no activan la cuenta solos. Cuando un cliente pague, actualiza su fila en
-Supabase → Table Editor (`plan_type`, `exp_date`, `is_active`) o con los `update` comentados al
-final de `sql/supabase_schema.sql`. El cambio aplica en el siguiente clic del usuario.
-
 ### Reglas
 
 - Contraseñas con PBKDF2-SHA256 (600 000 iteraciones), nunca en texto plano.
@@ -106,6 +103,57 @@ final de `sql/supabase_schema.sql`. El cambio aplica en el siguiente clic del us
 - Sesión única: el último inicio de sesión gana. Expira tras 2 h sin uso o 12 h en total.
 - 5 contraseñas incorrectas bloquean el correo 5 min; registros limitados a 3 por navegador cada 10 min y 30 por hora.
 - Si Supabase no responde, las cuentas de respaldo en `[[users]]` (Secrets) siguen entrando.
+
+## Pagos con Stripe (activación automática)
+
+```
+Cliente → botón del plan → Payment Link de Stripe (con su correo) → paga
+   ├─ Stripe → webhook → Supabase Edge Function "stripe-webhook" ─┐
+   └─ Stripe redirige a la app con ?session_id=cs_...  ───────────┤
+                                     public.apply_stripe_payment() → users.exp_date
+```
+
+Ambos caminos llaman a la misma función SQL; cada pago se aplica **una sola vez** (tabla `payments`).
+
+- **Mensual** suma 1 mes y **Anual** 1 año, contando desde hoy o desde el vencimiento actual si aún
+  está vigente. **De por vida** activa `vitalicio` y nunca se degrada.
+- **OXXO** y otros pagos diferidos se activan al confirmarse (`checkout.session.async_payment_succeeded`).
+- **Suscripciones**: cada cobro recurrente (`invoice.paid`) extiende la vigencia automáticamente.
+- **Pagó sin cuenta**: el pago queda pendiente y se aplica solo al registrarse con ese correo.
+- El plan se identifica por el Payment Link usado. Un link desconocido no se adivina: el webhook
+  responde error y Stripe reintenta hasta 3 días, con tiempo para corregir la configuración.
+
+### Configuración (una sola vez)
+
+1. **SQL**: Supabase → SQL Editor → ejecuta `sql/stripe_payments.sql` (después de `sql/supabase_schema.sql`).
+2. **Edge Function**: Supabase → Edge Functions → *Deploy a new function* → *Via Editor* → nombre
+   `stripe-webhook` → pega `supabase/functions/stripe-webhook/index.ts` → Deploy. En los ajustes de la
+   función **desactiva "Verify JWT"** (Stripe no envía JWT; la seguridad es la firma).
+   Con la CLI: `supabase functions deploy stripe-webhook --no-verify-jwt`.
+3. **Webhook en Stripe**: Stripe Dashboard → Developers / Workbench → Webhooks → *Add destination*:
+   - URL: `https://<tu-proyecto>.supabase.co/functions/v1/stripe-webhook`
+   - Eventos: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `invoice.paid`
+   - Copia el *Signing secret* (`whsec_...`).
+4. **Secrets de la función**: Supabase → Edge Functions → Secrets:
+   `STRIPE_SECRET_KEY` = `sk_test_...` y `STRIPE_WEBHOOK_SECRET` = `whsec_...`.
+   (`SUPABASE_URL` y la service role key los pone Supabase solo.)
+5. **Regreso a la app**: en cada Payment Link → *After payment* → *Don't show confirmation page* →
+   redirigir a `https://<tu-app>.streamlit.app/?session_id={CHECKOUT_SESSION_ID}`.
+6. **Streamlit Secrets**: agrega `[stripe] secret_key = "sk_test_..."` (ver `.streamlit/secrets.example.toml`).
+
+**Probar**: paga con la tarjeta `4242 4242 4242 4242`, cualquier fecha futura y CVC. En Supabase →
+Table Editor → `payments` verás el pago y en `users` la nueva `exp_date`. Si algo falla, revisa
+Stripe → Webhooks (respuesta de cada evento) y Supabase → Edge Functions → Logs.
+
+**Producción**: crea los Payment Links en modo live, pon sus URLs en `[saas.plans.*].url` (Streamlit)
+y en el secret `STRIPE_PLAN_LINKS` de la función como JSON
+`{"mensual": "...", "anual": "...", "vitalicio": "..."}`, cambia ambas claves a `sk_live_...` y crea
+el webhook live (tiene su propio `whsec_`).
+
+### Ajustes manuales
+
+Para cortesías o correcciones edita la fila en Supabase → Table Editor (`plan_type`, `exp_date`,
+`is_active`) o usa los `update` comentados al final de `sql/supabase_schema.sql`.
 
 ## Configuración (.env)
 
