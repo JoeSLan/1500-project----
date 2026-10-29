@@ -107,15 +107,22 @@ def test_access_screen_has_tabs_and_three_plans(db):
 
 
 # ---------------------------------------------------------------- sign-up
-def test_signup_creates_monthly_account_and_logs_in(db):
+def test_signup_gives_three_day_trial_and_logs_in(db):
     at = _signup(_app(), "Nueva@Correo.MX")
     assert not at.exception
     row = next(r for r in db.rows() if r["email"] == "nueva@correo.mx")
     assert row["plan_type"] == "mensual" and row["is_active"] is True
-    assert row["exp_date"] > today_mx().isoformat() and PASSWORD not in json.dumps(row)
+    assert row["exp_date"] == (today_mx() + timedelta(days=3)).isoformat()
+    assert PASSWORD not in json.dumps(row)
     assert _has_tool(at)
     text = _text(at)
-    assert "¡Bienvenido!" in text and "Plan **Mensual**" in text and "días restantes" in text
+    assert "prueba gratis" in text and "3 días restantes" in text
+
+
+def test_signup_trial_length_configurable(db):
+    _signup(_app(saas={"plans": PLAN_URLS, "signup_days": 7}), "siete@x.com")
+    row = next(r for r in db.rows() if r["email"] == "siete@x.com")
+    assert row["exp_date"] == (today_mx() + timedelta(days=7)).isoformat()
 
 
 @pytest.mark.parametrize(

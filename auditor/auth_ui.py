@@ -62,6 +62,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_USERS_JSON = PROJECT_ROOT / "users.json"
 EXPIRY_WARNING_DAYS = 7
 DEFAULT_SIGNUP_PLAN = "mensual"
+DEFAULT_TRIAL_DAYS = 3  # free trial on sign-up; override with [saas] signup_days
 
 # Sign-up throttling (per browser session and per server process).
 SIGNUPS_PER_SESSION = 3
@@ -135,16 +136,16 @@ def _saas_setting(key: str, env_var: str) -> str | None:
     return os.getenv(env_var) or None
 
 
-def _signup_days() -> int | None:
-    """[saas] signup_days: days of access granted on sign-up. Unset -> one month (plan Mensual)."""
+def _signup_days() -> int:
+    """[saas] signup_days: free-trial days granted on sign-up. Unset -> DEFAULT_TRIAL_DAYS."""
     raw = _saas_config().get("signup_days")
     if raw in (None, ""):
-        return None
+        return DEFAULT_TRIAL_DAYS
     try:
         return int(raw)
     except (TypeError, ValueError):
-        logger.error("[saas] signup_days debe ser un entero (valor: %r); se usa 1 mes.", raw)
-        return None
+        logger.error("[saas] signup_days debe ser un entero (valor: %r); se usan %s días.", raw, DEFAULT_TRIAL_DAYS)
+        return DEFAULT_TRIAL_DAYS
 
 
 def load_user_directory() -> UserDirectory:
@@ -473,7 +474,11 @@ def _render_signup_tab(supabase: SupabaseUserStore | None, static: StaticUserSto
     _start_session(user, supabase.name)
     status = evaluate_membership(user)
     if status.allowed:
-        _set_notice("success", f"¡Bienvenido! Tu cuenta está lista. Plan Mensual: {status.message.lower()}.")
+        _set_notice(
+            "success",
+            f"¡Bienvenido! Tu prueba gratis está activa: {status.message.lower()}. "
+            "Elige un plan antes de que termine para no perder el acceso.",
+        )
     st.rerun()
 
 
